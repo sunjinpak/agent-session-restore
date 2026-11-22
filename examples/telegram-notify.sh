@@ -6,4 +6,4 @@
 # Uses sendMessage only, so it never competes with a bot that polls updates.
 source "$HOME/.agent-session-restore/telegram.env"
 curl -s --max-time 20 "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-  --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=$1" >/dev/null
+  --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=$1" | grep -q '"ok":true'
