@@ -16,6 +16,8 @@ hand. This tool does it for you and tells you whether it worked.
 2. **Restore** after login: closes the empty windows Terminal reopened, then opens one
    window per saved session with `claude --resume <id>` or `codex resume <id>` from the
    session's own folder, at the saved position, back to front so stacking order holds.
+   Background sessions of the `claude agents` view are continued with
+   `claude --bg --resume <id>` (same session id), and the agents window is reopened.
 3. **Unstick prompts** so a remote Mac does not sit waiting: answers Claude's
    "Do you trust this folder?" prompt (asked again on every launch in some folders,
    such as your home folder) and Codex's working-directory prompt.

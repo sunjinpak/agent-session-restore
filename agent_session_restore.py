@@ -11,9 +11,12 @@ snapshot  record windows now (one shot).
 restore   reopen windows from the last snapshot now.
 verify    check the restored sessions, unstick prompts, relaunch missing ones.
 status    print the snapshot and the last run.
+
+Background sessions of the `claude agents` view are saved too and continued
+with `claude --bg --resume <id>`; the agents window itself is reopened.
 mark      mark the current boot as already restored (used by install.sh).
 """
-import fcntl, glob, json, os, socket, subprocess, sys, time
+import fcntl, glob, json, os, pty, select, shutil, socket, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("ASR_DIR", os.path.join(HOME, ".agent-session-restore"))
@@ -156,6 +159,8 @@ def which_agent(cmd):
     toks = cmd.split()
     names = [os.path.basename(t) for t in toks[:2]]
     if names[0] == "claude":
+        if [t for t in toks[1:] if not t.startswith("-")][:1] == ["agents"]:
+            return "agents", [t for t in toks[1:] if t != "agents"]
         return "claude", toks[1:]
     if "codex" in names or "codex-darwin" in cmd or "codex-aarch64" in cmd:
         i = names.index("codex") + 1 if "codex" in names else 1
@@ -233,6 +238,53 @@ def save_run(**kw):
 
 # ---------- snapshot ----------
 
+def claude_bin(c):
+    return shutil.which(c["claude_cmd"]) or c["claude_cmd"]
+
+
+def bg_sessions(c):
+    """Live background sessions of the `claude agents` view (not done/failed)."""
+    try:
+        out = subprocess.run([claude_bin(c), "agents", "--json"], capture_output=True, text=True,
+                             timeout=30, cwd=HOME).stdout
+        return [{"id": x["sessionId"], "cwd": x.get("cwd", HOME), "name": x.get("name", "")}
+                for x in json.loads(out)
+                if x.get("kind") == "background" and x.get("state") in ("working", "blocked", "idle", "waiting")]
+    except Exception:
+        return []
+
+
+def resume_bg(e, c):
+    """`claude --bg --resume <id>` continues the same background session (extra
+    flags would start a copy instead). Claude asks "trust this folder?" on a pty
+    in some folders (home folder: every launch); answer Down+Enter if auto_trust."""
+    cwd = e.get("cwd", HOME)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(cwd if os.path.isdir(cwd) else HOME)
+        b = claude_bin(c)
+        os.execv(b, [b, "--bg", "--resume", e["id"]])
+    buf, sent, end = b"", False, time.time() + 90
+    while time.time() < end:
+        if select.select([fd], [], [], 1)[0]:
+            try:
+                d = os.read(fd, 4096)
+            except OSError:
+                break
+            if not d:
+                break
+            buf += d
+            if c["auto_trust"] and not sent and b"trust" in buf.lower():  # ANSI codes split the prompt text
+                time.sleep(1.5)
+                os.write(fd, b"\x1b[B")
+                time.sleep(0.5)
+                os.write(fd, b"\r")
+                sent = True
+        if os.waitpid(pid, os.WNOHANG)[0]:
+            break
+    return b"backgrounded" in buf
+
+
 def snapshot():
     if not terminal_running():
         return
@@ -244,6 +296,9 @@ def snapshot():
             if ptty != tty:
                 continue
             kind, args = which_agent(cmd)
+            if kind == "agents":
+                entry.update(kind=kind, id="agents", cwd=proc_cwd(pid), flags=keep_flags(args, CLAUDE_BOOL, CLAUDE_VAL))
+                break
             if kind == "claude":
                 sid, cwd = claude_session(pid, start, args)
                 flags = keep_flags(args, CLAUDE_BOOL, CLAUDE_VAL)
@@ -256,11 +311,12 @@ def snapshot():
                 entry.update(kind=kind, id=sid, cwd=cwd, flags=flags)
                 break
         entries.append(entry)
-    if not any(e["kind"] != "shell" for e in entries):
+    bg = bg_sessions(cfg())
+    if not bg and not any(e["kind"] != "shell" for e in entries):
         return  # keep the previous snapshot
     os.makedirs(DIR, exist_ok=True)
     tmp = STATE + ".tmp"
-    json.dump({"saved": time.strftime("%Y-%m-%d %H:%M:%S"), "windows": entries}, open(tmp, "w"),
+    json.dump({"saved": time.strftime("%Y-%m-%d %H:%M:%S"), "windows": entries, "bg": bg}, open(tmp, "w"),
               ensure_ascii=False, indent=1)
     os.replace(tmp, STATE)
 
@@ -279,6 +335,9 @@ def launch_cmd(e, c):
     cwd = e.get("cwd", HOME)
     if e["kind"] == "claude":
         args = e.get("flags", []) + c["claude_extra_args"] + ["--resume", e["id"]]
+        return f"cd {q(cwd)} && command {c['claude_cmd']} " + " ".join(q(a) for a in args)
+    if e["kind"] == "agents":
+        args = e.get("flags", []) + c["claude_extra_args"] + ["agents"]
         return f"cd {q(cwd)} && command {c['claude_cmd']} " + " ".join(q(a) for a in args)
     if e["kind"] == "codex":
         args = ["resume"] + e.get("flags", []) + c["codex_extra_args"] + [e["id"]]
@@ -332,6 +391,10 @@ def restore(exclude_tty=None):
     for wid, _, tty, _ in terminal_windows():
         if tty != exclude_tty and tty not in busy:
             osa(f'tell application "Terminal" to close window id {wid} saving no')
+    bg = snap.get("bg", [])
+    back = [e["name"] or e["id"][:8] for e in bg if resume_bg(e, c)]
+    if bg:
+        log(f"restore: resumed {len(back)}/{len(bg)} background sessions: {', '.join(back)}")
     claude_ttys = []
     # open back to front so the original front window ends up on top;
     # windows whose folder is not there yet (network drive mounting) go last
@@ -341,14 +404,14 @@ def restore(exclude_tty=None):
         if e in later:
             continue
         tty = open_window(e, c)
-        if e["kind"] == "claude":
+        if e["kind"] in ("claude", "agents"):
             claude_ttys.append(tty)
         time.sleep(1)
     deadline = time.time() + c["folder_wait"]
     while later and time.time() < deadline:
         for e in [e for e in later if os.path.isdir(e["cwd"])]:
             tty = open_window(e, c)
-            if e["kind"] == "claude":
+            if e["kind"] in ("claude", "agents"):
                 claude_ttys.append(tty)
             later.remove(e)
         if later:
@@ -364,6 +427,8 @@ def restore(exclude_tty=None):
 # ---------- verify ----------
 
 def find_session(e, ps):
+    if e["kind"] == "agents":
+        return next((tty for _, tty, _, cmd in ps if which_agent(cmd)[0] == "agents"), None)
     for pid, tty, _, cmd in ps:
         if e["id"] in cmd:
             return tty
@@ -431,15 +496,25 @@ def verify():
                 break
             time.sleep(5)
         tty = open_window(e, c)
-        if e["kind"] == "claude" and c["auto_trust"]:
+        if e["kind"] in ("claude", "agents") and c["auto_trust"]:
             accept_trust_prompts([tty], wait=60)
         fixed.append(f"relaunched: {label}")
+    want_bg = snap.get("bg", [])
+    alive = {x["id"] for x in bg_sessions(c)}
+    for e in [e for e in want_bg if e["id"] not in alive]:
+        if resume_bg(e, c):
+            fixed.append(f"relaunched background: {e['name'] or e['id'][:8]}")
     if fixed:
         time.sleep(15)
         missing, moved, stuck = check(expected)
+    alive = {x["id"] for x in bg_sessions(c)}
+    bg_missing = [e["name"] or e["id"][:8] for e in want_bg if e["id"] not in alive]
     ok = len(expected) - len(missing) - len(stuck)
-    good = not missing and not stuck
-    lines = [f"{'✅' if good else '⚠️'} {c['name']}: {ok}/{len(expected)} sessions restored after restart"]
+    good = not missing and not stuck and not bg_missing
+    lines = [f"{'✅' if good else '⚠️'} {c['name']}: {ok}/{len(expected)} windows"
+             + (f", {len(want_bg) - len(bg_missing)}/{len(want_bg)} background sessions" if want_bg else "")
+             + " restored after restart"]
+    lines += [f"- background session not running: {n}" for n in bg_missing]
     lines += [f"- fixed, {f}" for f in fixed]
     lines += [f"- missing: {label}" for _, label in missing]
     lines += [f"- stuck at a prompt: {label}" for _, _, label in stuck]
@@ -518,6 +593,8 @@ def status():
         print(f"snapshot {s['saved']}:")
         for e in s["windows"]:
             print(f"  {e['kind']:6} {e.get('id', '')[:8]:8} {e.get('cwd', '')}  {e['bounds']}")
+        for e in s.get("bg", []):
+            print(f"  bg     {e['id'][:8]:8} {e['cwd']}  {e['name']}")
     else:
         print("no snapshot yet")
     print("this boot:", json.dumps({k: v for k, v in load_run().items() if k != "snapshot"}, ensure_ascii=False))
